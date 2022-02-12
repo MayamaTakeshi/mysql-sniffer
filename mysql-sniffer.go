@@ -12,8 +12,6 @@
  *
  * written by Mark Smith <mark@qq.is>
  *
- * requires the gopcap library to be installed from:
- *   https://github.com/akrennmair/gopcap
  *
  */
 
@@ -22,8 +20,9 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/akrennmair/gopcap"
-	_ "github.com/davecgh/go-spew/spew"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 	"log"
 	"math/rand"
 	"sort"
@@ -116,7 +115,7 @@ func UnixNow() int64 {
 
 func main() {
 	var lport *int = flag.Int("P", 3306, "MySQL port to use")
-	var eth *string = flag.String("i", "eth0", "Interface to sniff")
+	var iface *string = flag.String("i", "eth0", "Interface to sniff")
 	var ldirty *bool = flag.Bool("u", false, "Unsanitized -- do not canonicalize queries")
 	var period *int = flag.Int("t", 10, "Seconds between outputting status")
 	var displaycount *int = flag.Int("d", 15, "Display this many queries in status updates")
@@ -137,36 +136,32 @@ func main() {
 	log.SetPrefix("")
 	log.SetFlags(0)
 
-	log.Printf("Initializing MySQL sniffing on %s:%d...", *eth, port)
-	iface, err := pcap.Openlive(*eth, 1024, false, 0)
-	if iface == nil || err != nil {
-		msg := "unknown error"
-		if err != nil {
-			msg = err.Error()
-		}
-		log.Fatalf("Failed to open device: %s", msg)
+	log.Printf("Initializing MySQL sniffing on %s:%d...", *iface, port)
+
+	handle, err := pcap.OpenLive(*iface, 65536, true, pcap.BlockForever)
+
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	err = iface.Setfilter(fmt.Sprintf("tcp port %d", port))
-	if err != nil {
+	if err = handle.SetBPFFilter(fmt.Sprintf("tcp port %d", port)); err != nil {
 		log.Fatalf("Failed to set port filter: %s", err.Error())
 	}
 
 	last := UnixNow()
-	var pkt *pcap.Packet = nil
-	var rv int32 = 0
 
-	for rv = 0; rv >= 0; {
-		for pkt, rv = iface.NextEx(); pkt != nil; pkt, rv = iface.NextEx() {
-			handlePacket(pkt)
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	//fmt.Println(packetSource)
 
-			// simple output printer... this should be super fast since we expect that a
-			// system like this will have relatively few unique queries once they're
-			// canonicalized.
-			if !verbose && querycount%1000 == 0 && last < UnixNow()-int64(*period) {
-				last = UnixNow()
-				handleStatusUpdate(*displaycount, *sortby, *cutoff)
-			}
+	for pkt := range packetSource.Packets() {
+		handlePacket(pkt)
+
+		// simple output printer... this should be super fast since we expect that a
+		// system like this will have relatively few unique queries once they're
+		// canonicalized.
+		if !verbose && querycount%1000 == 0 && last < UnixNow()-int64(*period) {
+			last = UnixNow()
+			handleStatusUpdate(*displaycount, *sortby, *cutoff)
 		}
 	}
 }
@@ -436,27 +431,28 @@ func carvePacket(buf *[]byte) (int, []byte) {
 // extract the data... we have to figure out where it is, which means extracting data
 // from the various headers until we get the location we want.  this is crude, but
 // functional and it should be fast.
-func handlePacket(pkt *pcap.Packet) {
-	// Ethernet frame has 14 bytes of stuff to ignore, so we start our root position here
-	var pos byte = 14
+func handlePacket(pkt gopacket.Packet) {
+	ipLayer := pkt.Layer(layers.LayerTypeIPv4)
+	if ipLayer == nil {
+		return
+	}
 
-	// Grab the src IP address of this packet from the IP header.
-	srcIP := pkt.Data[pos+12 : pos+16]
-	dstIP := pkt.Data[pos+16 : pos+20]
+	ip, _ := ipLayer.(*layers.IPv4)
+	//fmt.Printf("From src host %s to dst host %s\n", ip.SrcIP, ip.DstIP)
 
-	// The IP frame has the header length in bits 4-7 of byte 0 (relative).
-	pos += pkt.Data[pos] & 0x0F * 4
+	_ = ip
 
-	// Grab the source port from the TCP header.
-	srcPort := uint16(pkt.Data[pos])<<8 + uint16(pkt.Data[pos+1])
-	dstPort := uint16(pkt.Data[pos+2])<<8 + uint16(pkt.Data[pos+3])
+	tcpLayer := pkt.Layer(layers.LayerTypeTCP)
+	if tcpLayer == nil {
+		return
+	}
 
-	// The TCP frame has the data offset in bits 4-7 of byte 12 (relative).
-	pos += byte(pkt.Data[pos+12]) >> 4 * 4
+	tcp, _ := tcpLayer.(*layers.TCP)
+	//fmt.Printf("From src port %d to dst port %d\n", tcp.SrcPort, tcp.DstPort)
 
-	// If this is a 0-length payload, do nothing. (Any way to change our filter
-	// to only dump packets with data?)
-	if len(pkt.Data[pos:]) <= 0 {
+	_ = tcp
+
+	if len(tcp.BaseLayer.Payload) <= 0 {
 		return
 	}
 
@@ -465,17 +461,14 @@ func handlePacket(pkt *pcap.Packet) {
 	// the remote end.
 	var src string
 	var request bool = false
-	if srcPort == port {
-		src = fmt.Sprintf("%d.%d.%d.%d:%d", dstIP[0], dstIP[1], dstIP[2],
-			dstIP[3], dstPort)
-		//log.Printf("response to %s", src)
-	} else if dstPort == port {
-		src = fmt.Sprintf("%d.%d.%d.%d:%d", srcIP[0], srcIP[1], srcIP[2],
-			srcIP[3], srcPort)
+	if uint16(tcp.SrcPort) == port {
+		src = fmt.Sprintf("%s:%d", ip.DstIP, tcp.DstPort)
+	} else if uint16(tcp.DstPort) == port {
+		src = fmt.Sprintf("%s:%d", ip.SrcIP, tcp.SrcPort)
 		request = true
 		//log.Printf("request from %s", src)
 	} else {
-		log.Fatalf("got packet src = %d, dst = %d", srcPort, dstPort)
+		log.Fatalf("got packet src = %d, dst = %d", tcp.SrcPort, tcp.DstPort)
 	}
 
 	// Get the data structure for this source, then do something.
@@ -488,7 +481,7 @@ func handlePacket(pkt *pcap.Packet) {
 	}
 
 	// Now with a source, process the packet.
-	processPacket(rs, request, pkt.Data[pos:])
+	processPacket(rs, request, tcp.BaseLayer.Payload)
 }
 
 // scans forward in the query given the current type and returns when we encounter
